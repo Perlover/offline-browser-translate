@@ -615,6 +615,14 @@ function setupEventListeners() {
         });
     }
 
+    // Open translator page
+    const openTranslatorBtn = document.getElementById('openTranslator');
+    if (openTranslatorBtn) {
+        openTranslatorBtn.addEventListener('click', () => {
+            browserAPI.tabs.create({ url: browserAPI.runtime.getURL('translator/translator.html') });
+        });
+    }
+
     // Reset settings to defaults
     if (elements.resetSettings) {
         elements.resetSettings.addEventListener('click', async () => {
