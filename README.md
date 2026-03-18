@@ -112,7 +112,14 @@ browser.storage.local.get('settings').then(r => {
 });
 ```
 
-To disable: replace `debug: true` with `debug: false`.
+To disable, run the same command with `debug: false`:
+
+```js
+browser.storage.local.get('settings').then(r => {
+  const s = { ...r.settings, debug: false };
+  browser.storage.local.set({ settings: s }).then(() => console.log('Debug disabled'));
+});
+```
 
 Debug logs use `[Background]` prefix and include request/response details for Ollama/LMStudio API calls. Content script and popup logs use `console.debug()` and are visible when the "Debug" log level is enabled in the browser console.
 
