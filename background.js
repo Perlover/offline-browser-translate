@@ -606,6 +606,11 @@ browserAPI.runtime.onMessage.addListener((message, sender, sendResponse) => {
             debugLog('[Background] Received message:', message.type, 'from:', sender.tab ? `tab ${sender.tab.id}` : 'popup/other');
 
             switch (message.type) {
+                case 'CONTENT_SCRIPT_LOADED':
+                    debugLog('[Background] Content script loaded on:', message.url);
+                    sendResponse({ ok: true });
+                    break;
+
                 case 'GET_SETTINGS':
                     sendResponse({ settings });
                     break;

@@ -16,6 +16,22 @@ if (window.hasLLMTranslatorContentScript) {
 window.hasLLMTranslatorContentScript = true;
 // console.debug('[Translator] Content script loaded and initialized on', window.location.href);
 
+// Settings and debug logger
+let currentSettings = {};
+function debugLog(...args) {
+    if (currentSettings.debug) console.log(...args);
+}
+function debugWarn(...args) {
+    if (currentSettings.debug) console.warn(...args);
+}
+
+// Load settings on init
+browserAPI.runtime.sendMessage({ type: 'GET_SETTINGS' }).then(response => {
+    if (response && response.settings) {
+        currentSettings = response.settings;
+    }
+}).catch(() => { /* extension context may not be ready */ });
+
 // Track text nodes and their original content
 const textNodeMap = new Map();
 const translatedNodeSet = new Set(); // Track which nodes have been translated
@@ -271,7 +287,7 @@ function extractSelectionTextNodes(selection) {
     const textItems = [];
     const seenNodes = new Set();
 
-    console.log('[Translator] Extracting text nodes from selection, ranges:', selection.rangeCount);
+    debugLog('[Translator] Extracting text nodes from selection, ranges:', selection.rangeCount);
 
     for (let i = 0; i < selection.rangeCount; i++) {
         const range = selection.getRangeAt(i);
@@ -310,7 +326,7 @@ function extractSelectionTextNodes(selection) {
             }
 
             if (existingId !== null) {
-                console.log('[Translator] Reusing existing textNodeMap entry for node id:', existingId);
+                debugLog('[Translator] Reusing existing textNodeMap entry for node id:', existingId);
                 textItems.push({
                     id: existingId,
                     text: node.textContent.trim(),
@@ -830,6 +846,144 @@ async function translatePage(targetLanguage, sourceLanguage = 'auto', enableAuto
     }
 }
 
+// ============================================================================
+// Floating translate button for text selection
+// ============================================================================
+
+let floatingTranslateBtn = null;
+let selectionChangeTimer = null;
+let suppressFloatingBtn = false; // Suppress button briefly after translation completes
+
+/**
+ * Create the floating translate button element (once, reused)
+ */
+function getFloatingTranslateBtn() {
+    if (floatingTranslateBtn) return floatingTranslateBtn;
+
+    const btn = document.createElement('div');
+    btn.id = 'llm-translator-float-btn';
+    btn.title = 'Translate Selection';
+    btn.style.cssText = `
+        position: absolute;
+        width: 28px;
+        height: 28px;
+        cursor: pointer;
+        z-index: 999999;
+        border-radius: 6px;
+        background-color: #A7C080;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+        display: none;
+        align-items: center;
+        justify-content: center;
+        transition: opacity 0.15s, transform 0.15s;
+        opacity: 0;
+        transform: scale(0.8);
+    `;
+
+    const img = document.createElement('img');
+    img.src = browserAPI.runtime.getURL('icons/icon16.png');
+    img.style.cssText = 'width: 16px; height: 16px; pointer-events: none;';
+    btn.appendChild(img);
+
+    btn.addEventListener('mousedown', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+    });
+
+    btn.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        debugLog('[Translator] Floating button clicked, starting selection translation');
+        hideFloatingBtn();
+        // Use settings to get target/source language
+        browserAPI.runtime.sendMessage({ type: 'GET_SETTINGS' }).then(response => {
+            const settings = response.settings || {};
+            const targetLang = settings.targetLanguage || 'en';
+            const sourceLang = settings.sourceLanguage || 'auto';
+            translateSelection(targetLang, sourceLang);
+        }).catch(err => {
+            debugWarn('[Translator] Failed to get settings for selection translation:', err);
+            translateSelection('en', 'auto');
+        });
+    });
+
+    document.body.appendChild(btn);
+    floatingTranslateBtn = btn;
+    return btn;
+}
+
+/**
+ * Show floating translate button near the end of selection
+ */
+function showFloatingBtn(selection) {
+    if (!selection || selection.isCollapsed || selection.rangeCount === 0) return;
+
+    const range = selection.getRangeAt(selection.rangeCount - 1);
+    const rects = range.getClientRects();
+    // Use last client rect for precise position at end of selection
+    const rect = rects.length > 0 ? rects[rects.length - 1] : range.getBoundingClientRect();
+    if (rect.width === 0 && rect.height === 0) return;
+
+    const btn = getFloatingTranslateBtn();
+    const scrollX = window.scrollX;
+    const scrollY = window.scrollY;
+
+    // Position below-right of the last character in selection
+    btn.style.left = (rect.right + scrollX + 4) + 'px';
+    btn.style.top = (rect.bottom + scrollY + 4) + 'px';
+    btn.style.display = 'flex';
+
+    // Trigger animation
+    requestAnimationFrame(() => {
+        btn.style.opacity = '1';
+        btn.style.transform = 'scale(1)';
+    });
+}
+
+/**
+ * Hide the floating translate button
+ */
+function hideFloatingBtn() {
+    if (floatingTranslateBtn) {
+        floatingTranslateBtn.style.opacity = '0';
+        floatingTranslateBtn.style.transform = 'scale(0.8)';
+        setTimeout(() => {
+            if (floatingTranslateBtn) {
+                floatingTranslateBtn.style.display = 'none';
+            }
+        }, 150);
+    }
+}
+
+/**
+ * Handle selection changes — show/hide floating button
+ */
+document.addEventListener('selectionchange', () => {
+    if (selectionChangeTimer) clearTimeout(selectionChangeTimer);
+    selectionChangeTimer = setTimeout(() => {
+        const selection = window.getSelection();
+        const selectedText = selection ? selection.toString().trim() : '';
+        debugLog('[Translator] selectionchange:', selectedText.length, 'chars, collapsed:', selection?.isCollapsed);
+        if (selection && !selection.isCollapsed && selectedText.length >= MIN_TEXT_LENGTH) {
+            if (!translationInProgress && !suppressFloatingBtn) {
+                debugLog('[Translator] Showing floating translate button');
+                showFloatingBtn(selection);
+            } else {
+                debugLog('[Translator] Translation in progress, not showing button');
+            }
+        } else {
+            hideFloatingBtn();
+        }
+    }, 300);
+});
+
+// Hide button on scroll (position becomes stale)
+window.addEventListener('scroll', () => {
+    if (floatingTranslateBtn && floatingTranslateBtn.style.display !== 'none') {
+        hideFloatingBtn();
+    }
+}, { passive: true });
+
 /**
  * Translate only the currently selected text
  */
@@ -841,13 +995,14 @@ async function translateSelection(targetLanguage, sourceLanguage = 'auto') {
 
     const selection = window.getSelection();
     if (!selection || selection.isCollapsed || selection.rangeCount === 0) {
-        console.log('[Translator] No text selected for translation');
+        debugLog('[Translator] No text selected for translation');
         showStatus('No text selected', true);
         setTimeout(hideStatus, 2000);
         return;
     }
 
-    console.log('[Translator] Starting selection translation, target:', targetLanguage);
+    debugLog('[Translator] Starting selection translation, target:', targetLanguage);
+    hideFloatingBtn();
     currentTargetLanguage = targetLanguage;
     translationInProgress = true;
     translationCancelled = false;
@@ -908,17 +1063,20 @@ async function translateSelection(targetLanguage, sourceLanguage = 'auto') {
             isShowingTranslations = true;
         }
 
-        console.log('[Translator] Selection translation complete:', totalApplied + '/' + textItems.length);
+        debugLog('[Translator] Selection translation complete:', totalApplied + '/' + textItems.length);
         showStatus(`Translated ${totalApplied}/${textItems.length} selected elements`);
         setTimeout(hideStatus, 4000);
 
     } catch (e) {
-        console.error('[Translator] Selection translation error:', e);
+        debugWarn('[Translator] Selection translation error:', e);
         showStatus(`Error: ${e.message}`, true);
         setTimeout(hideStatus, 5000);
     } finally {
         translationInProgress = false;
         translationCancelled = false;
+        // Suppress floating button briefly so it doesn't appear on stale selection
+        suppressFloatingBtn = true;
+        setTimeout(() => { suppressFloatingBtn = false; }, 1000);
         if (keepAliveInterval) {
             clearInterval(keepAliveInterval);
         }
@@ -1155,4 +1313,5 @@ browserAPI.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
 });
 
-console.log('Local LLM Translator content script loaded');
+// Notify background that content script is loaded (visible in extension console)
+browserAPI.runtime.sendMessage({ type: 'CONTENT_SCRIPT_LOADED', url: window.location.href }).catch(() => {});
