@@ -14,7 +14,7 @@ if (window.hasLLMTranslatorContentScript) {
     throw new Error('Content script already injected'); // Determines this execution stop
 }
 window.hasLLMTranslatorContentScript = true;
-console.debug('[Translator] Content script loaded and initialized on', window.location.href);
+// console.debug('[Translator] Content script loaded and initialized on', window.location.href);
 
 // Track text nodes and their original content
 const textNodeMap = new Map();
@@ -574,7 +574,7 @@ async function translatePage(targetLanguage, sourceLanguage = 'auto', enableAuto
     try {
         keepAlivePort = browserAPI.runtime.connect({ name: 'keepalive' });
         keepAlivePort.onDisconnect.addListener(() => {
-            console.debug('[Translator] Keep-alive port disconnected');
+            // Keep-alive port disconnected
             keepAlivePort = null;
             if (keepAliveInterval) {
                 clearInterval(keepAliveInterval);

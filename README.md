@@ -99,29 +99,25 @@ The codebase is intentionally simple with no build step or dependencies:
 
 ### Debug Logging
 
-To enable verbose logging in the background script:
+Enable the **"Enable debug logging"** checkbox in the extension's Options page (Output Settings section), then click Save.
 
-1. Go to `about:debugging#/runtime/this-firefox`
-2. Find **Local LLM Translator** and click **Inspect** — this opens the extension's background DevTools
-3. In the Console tab, run:
+To view the logs, go to `about:debugging#/runtime/this-firefox`, find **Local LLM Translator** and click **Inspect** — debug messages with `[Background]` prefix will appear in the Console tab.
+
+Alternatively, you can toggle debug directly from the Inspect console:
 
 ```js
+// Enable
 browser.storage.local.get('settings').then(r => {
   const s = { ...r.settings, debug: true };
   browser.storage.local.set({ settings: s }).then(() => console.log('Debug enabled'));
 });
-```
 
-To disable, run the same command with `debug: false`:
-
-```js
+// Disable
 browser.storage.local.get('settings').then(r => {
   const s = { ...r.settings, debug: false };
   browser.storage.local.set({ settings: s }).then(() => console.log('Debug disabled'));
 });
 ```
-
-Debug logs use `[Background]` prefix and include request/response details for Ollama/LMStudio API calls. Content script and popup logs use `console.debug()` and are visible when the "Debug" log level is enabled in the browser console.
 
 ## License
 
