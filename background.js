@@ -138,25 +138,43 @@ async function detectProviders(ollamaUrl, lmstudioUrl) {
 }
 
 async function listOllamaModels(url) {
-    const response = await fetch(`${url}/api/tags`);
-    if (!response.ok) throw new Error('Failed to fetch Ollama models');
-    const data = await response.json();
-    return (data.models || []).map(m => ({
-        id: m.name,
-        name: m.name,
-        provider: 'ollama'
-    }));
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 5000);
+    try {
+        const response = await fetch(`${url}/api/tags`, { signal: controller.signal });
+        clearTimeout(timeoutId);
+        if (!response.ok) throw new Error('Failed to fetch Ollama models');
+        const data = await response.json();
+        return (data.models || []).map(m => ({
+            id: m.name,
+            name: m.name,
+            provider: 'ollama'
+        }));
+    } catch (e) {
+        clearTimeout(timeoutId);
+        if (e.name === 'AbortError') throw new Error('Ollama model list request timed out');
+        throw e;
+    }
 }
 
 async function listLMStudioModels(url) {
-    const response = await fetch(`${url}/v1/models`);
-    if (!response.ok) throw new Error('Failed to fetch LMStudio models');
-    const data = await response.json();
-    return (data.data || []).map(m => ({
-        id: m.id,
-        name: m.id,
-        provider: 'lmstudio'
-    }));
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 5000);
+    try {
+        const response = await fetch(`${url}/v1/models`, { signal: controller.signal });
+        clearTimeout(timeoutId);
+        if (!response.ok) throw new Error('Failed to fetch LMStudio models');
+        const data = await response.json();
+        return (data.data || []).map(m => ({
+            id: m.id,
+            name: m.id,
+            provider: 'lmstudio'
+        }));
+    } catch (e) {
+        clearTimeout(timeoutId);
+        if (e.name === 'AbortError') throw new Error('LMStudio model list request timed out');
+        throw e;
+    }
 }
 
 async function listModels(settings, useCache = true) {
@@ -285,6 +303,14 @@ function parseTranslationResponse(response, originalItems) {
         return translations;
     }
 
+    // Single item: treat the entire response as one translation (preserves newlines)
+    if (expectedCount === 1) {
+        let text = response.trim();
+        // Remove possible "[0]: " prefix
+        text = text.replace(/^\[?\d+\]?:\s*/, '');
+        return [{ id: originalItems[0].id, text: cleanTranslationText(text) }];
+    }
+
     // Fallback: parse line-by-line format using ORIGINAL item IDs
     // console.log('[Background] Using fallback line-by-line parsing');
     const lines = response.split('\n').filter(l => l.trim());
@@ -339,11 +365,25 @@ async function callOllama(settings, modelId, systemPrompt, userPrompt) {
         body.options = { temperature: settings.temperature };
     }
 
-    const response = await fetch(`${settings.ollamaUrl}/api/generate`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body)
-    });
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 120000);
+
+    let response;
+    try {
+        response = await fetch(`${settings.ollamaUrl}/api/generate`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+            signal: controller.signal
+        });
+    } catch (e) {
+        clearTimeout(timeoutId);
+        if (e.name === 'AbortError') {
+            throw new Error('Ollama request timed out (120s). The server may be busy.');
+        }
+        throw e;
+    }
+    clearTimeout(timeoutId);
 
     if (!response.ok) {
         const error = await response.text();
@@ -402,11 +442,25 @@ async function callLMStudio(settings, modelId, systemPrompt, userPrompt) {
         body.response_format = TRANSLATION_SCHEMA;
     }
 
-    const response = await fetch(`${settings.lmstudioUrl}/v1/chat/completions`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body)
-    });
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 120000);
+
+    let response;
+    try {
+        response = await fetch(`${settings.lmstudioUrl}/v1/chat/completions`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+            signal: controller.signal
+        });
+    } catch (e) {
+        clearTimeout(timeoutId);
+        if (e.name === 'AbortError') {
+            throw new Error('LMStudio request timed out (120s). The server may be busy.');
+        }
+        throw e;
+    }
+    clearTimeout(timeoutId);
 
     if (!response.ok) {
         const error = await response.text();
