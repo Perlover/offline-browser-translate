@@ -265,6 +265,78 @@ function extractTextNodes(root = document.body, onlyNew = false) {
 }
 
 /**
+ * Extract text nodes from the current selection
+ */
+function extractSelectionTextNodes(selection) {
+    const textItems = [];
+    const seenNodes = new Set();
+
+    console.log('[Translator] Extracting text nodes from selection, ranges:', selection.rangeCount);
+
+    for (let i = 0; i < selection.rangeCount; i++) {
+        const range = selection.getRangeAt(i);
+        const ancestor = range.commonAncestorContainer;
+        const root = ancestor.nodeType === Node.TEXT_NODE ? ancestor.parentElement : ancestor;
+        if (!root) continue;
+
+        const walker = document.createTreeWalker(
+            root,
+            NodeFilter.SHOW_TEXT,
+            {
+                acceptNode: (node) => {
+                    if (seenNodes.has(node)) return NodeFilter.FILTER_REJECT;
+                    if (!range.intersectsNode(node)) return NodeFilter.FILTER_REJECT;
+                    const parent = node.parentElement;
+                    if (!parent || shouldSkipElement(parent)) return NodeFilter.FILTER_REJECT;
+                    if (!isTranslatableText(node.textContent)) return NodeFilter.FILTER_REJECT;
+                    const style = window.getComputedStyle(parent);
+                    if (style.display === 'none' || style.visibility === 'hidden') return NodeFilter.FILTER_REJECT;
+                    return NodeFilter.FILTER_ACCEPT;
+                }
+            }
+        );
+
+        let node;
+        while (node = walker.nextNode()) {
+            seenNodes.add(node);
+
+            // Check if this node already exists in textNodeMap
+            let existingId = null;
+            for (const [id, entry] of textNodeMap) {
+                if (entry.node === node) {
+                    existingId = id;
+                    break;
+                }
+            }
+
+            if (existingId !== null) {
+                console.log('[Translator] Reusing existing textNodeMap entry for node id:', existingId);
+                textItems.push({
+                    id: existingId,
+                    text: node.textContent.trim(),
+                    priority: calculatePriority(node)
+                });
+            } else {
+                const id = nextId++;
+                textNodeMap.set(id, {
+                    node,
+                    originalText: node.textContent
+                });
+                textItems.push({
+                    id,
+                    text: node.textContent.trim(),
+                    priority: calculatePriority(node)
+                });
+            }
+        }
+    }
+
+    textItems.sort((a, b) => b.priority - a.priority);
+    console.log('[Translator] Found', textItems.length, 'translatable text nodes in selection');
+    return textItems;
+}
+
+/**
  * Extract text nodes from newly added elements
  */
 function extractNewTextNodes(addedNodes) {
@@ -759,6 +831,103 @@ async function translatePage(targetLanguage, sourceLanguage = 'auto', enableAuto
 }
 
 /**
+ * Translate only the currently selected text
+ */
+async function translateSelection(targetLanguage, sourceLanguage = 'auto') {
+    if (translationInProgress) {
+        showStatus('Translation already in progress...', true);
+        return;
+    }
+
+    const selection = window.getSelection();
+    if (!selection || selection.isCollapsed || selection.rangeCount === 0) {
+        console.log('[Translator] No text selected for translation');
+        showStatus('No text selected', true);
+        setTimeout(hideStatus, 2000);
+        return;
+    }
+
+    console.log('[Translator] Starting selection translation, target:', targetLanguage);
+    translationInProgress = true;
+    translationCancelled = false;
+
+    // Keep-alive mechanism
+    let keepAlivePort = null;
+    let keepAliveInterval = null;
+    try {
+        keepAlivePort = browserAPI.runtime.connect({ name: 'keepalive' });
+        keepAlivePort.onDisconnect.addListener(() => {
+            keepAlivePort = null;
+            if (keepAliveInterval) {
+                clearInterval(keepAliveInterval);
+                keepAliveInterval = null;
+            }
+        });
+        keepAliveInterval = setInterval(() => {
+            if (keepAlivePort) {
+                try {
+                    keepAlivePort.postMessage({ type: 'ping' });
+                } catch (e) {
+                    clearInterval(keepAliveInterval);
+                    keepAliveInterval = null;
+                }
+            }
+        }, 20000);
+    } catch (e) {
+        console.warn('[Translator] Failed to open keep-alive port:', e.message);
+    }
+
+    showStatus('Extracting selected text...');
+
+    try {
+        const textItems = extractSelectionTextNodes(selection);
+
+        if (textItems.length === 0) {
+            showStatus('No translatable text in selection', true);
+            setTimeout(hideStatus, 3000);
+            return;
+        }
+
+        showStatus(`Translating ${textItems.length} selected elements...`);
+
+        let totalApplied = 0;
+        const batchSize = 8;
+
+        for (let i = 0; i < textItems.length && !translationCancelled; i += batchSize) {
+            const batch = textItems.slice(i, i + batchSize);
+            const result = await translateBatch(batch, targetLanguage, sourceLanguage);
+            totalApplied += result.applied;
+
+            const percent = Math.min(100, Math.round(((i + batch.length) / textItems.length) * 100));
+            showStatus(`Translating selection... ${percent}%`);
+        }
+
+        if (totalApplied > 0) {
+            hasTranslationCache = true;
+            isShowingTranslations = true;
+        }
+
+        console.log('[Translator] Selection translation complete:', totalApplied + '/' + textItems.length);
+        showStatus(`Translated ${totalApplied}/${textItems.length} selected elements`);
+        setTimeout(hideStatus, 4000);
+
+    } catch (e) {
+        console.error('[Translator] Selection translation error:', e);
+        showStatus(`Error: ${e.message}`, true);
+        setTimeout(hideStatus, 5000);
+    } finally {
+        translationInProgress = false;
+        translationCancelled = false;
+        if (keepAliveInterval) {
+            clearInterval(keepAliveInterval);
+        }
+        if (keepAlivePort) {
+            try { keepAlivePort.disconnect(); } catch (e) { /* already closed */ }
+        }
+    }
+}
+
+/**
  * Recalculate priorities for pending items based on current viewport
  */
 function recalculatePendingPriorities() {
@@ -883,6 +1052,14 @@ browserAPI.runtime.onMessage.addListener((message, sender, sendResponse) => {
             }
             // Pass sourceLanguage to translatePage
             translatePage(message.targetLanguage, message.sourceLanguage, true);
+            sendResponse({ started: true });
+            break;
+
+        case 'TRANSLATE_SELECTION':
+            if (message.showGlow !== undefined) showGlow = message.showGlow;
+            if (message.maxConcurrentRequests !== undefined)
+                maxConcurrentRequests = Math.max(1, Math.min(4, message.maxConcurrentRequests));
+            translateSelection(message.targetLanguage, message.sourceLanguage);
             sendResponse({ started: true });
             break;
 

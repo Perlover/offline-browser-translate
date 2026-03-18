@@ -676,6 +676,17 @@ browserAPI.runtime.onInstalled.addListener(() => {
             // Suppress duplicate id error
         }
     });
+
+    browserAPI.contextMenus.create({
+        id: "translate-selection",
+        title: "Translate Selection",
+        contexts: ["selection"]
+    }, () => {
+        if (browserAPI.runtime.lastError) {
+            // Suppress duplicate id error
+        }
+    });
+    debugLog('[Background] Created translate-selection context menu');
 });
 
 browserAPI.contextMenus.onClicked.addListener(async (info, tab) => {
@@ -739,6 +750,61 @@ browserAPI.contextMenus.onClicked.addListener(async (info, tab) => {
 
         } catch (e) {
             console.error('[Background] Context menu translation failed:', e);
+        }
+    } else if (info.menuItemId === "translate-selection") {
+        if (!tab || !tab.id) return;
+        debugLog('[Background] Translate selection requested for tab', tab.id);
+
+        try {
+            const settings = await getSettings();
+
+            // Resolve source language
+            let sourceLang = settings.sourceLanguage;
+            if (!sourceLang || sourceLang === 'auto') {
+                try {
+                    const result = await browserAPI.scripting.executeScript({
+                        target: { tabId: tab.id },
+                        func: () => {
+                            const htmlLang = document.documentElement.lang || document.querySelector('html')?.getAttribute('lang');
+                            if (htmlLang) return htmlLang.split('-')[0].toLowerCase();
+                            const metaLang = document.querySelector('meta[http-equiv="content-language"]')?.getAttribute('content');
+                            if (metaLang) return metaLang.split('-')[0].toLowerCase();
+                            return null;
+                        }
+                    });
+                    if (result && result[0] && result[0].result) {
+                        sourceLang = result[0].result;
+                        debugLog('[Background] Detected source language for selection:', sourceLang);
+                    }
+                } catch (detectErr) {
+                    debugLog('[Background] Could not detect language for selection:', detectErr);
+                }
+            }
+
+            const sendSelectionMessage = async () => {
+                await browserAPI.tabs.sendMessage(tab.id, {
+                    type: 'TRANSLATE_SELECTION',
+                    targetLanguage: settings.targetLanguage,
+                    sourceLanguage: sourceLang || 'auto',
+                    showGlow: settings.showGlow,
+                    maxConcurrentRequests: settings.maxConcurrentRequests || 4
+                });
+            };
+
+            try {
+                await sendSelectionMessage();
+            } catch (e) {
+                debugLog('[Background] Selection: content script not loaded, injecting:', e.message);
+                await browserAPI.scripting.executeScript({
+                    target: { tabId: tab.id },
+                    files: ['content.js']
+                });
+                await new Promise(resolve => setTimeout(resolve, 200));
+                await sendSelectionMessage();
+            }
+
+        } catch (e) {
+            debugWarn('[Background] Selection translation failed:', e);
         }
     }
 });
