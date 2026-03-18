@@ -414,14 +414,16 @@ async function startTranslation() {
 
         // Try to inject content script
         try {
+            console.debug('[Popup] Injecting content script into tab', tab.id, tab.url);
             await browserAPI.scripting.executeScript({
                 target: { tabId: tab.id },
                 files: ['/content.js']
             });
+            console.debug('[Popup] Content script injection succeeded');
             // Give it a moment to initialize
             await new Promise(resolve => setTimeout(resolve, 100));
         } catch (injectErr) {
-            console.log('Script injection note:', injectErr.message);
+            console.debug('[Popup] Script injection failed:', injectErr.message);
             // May already be injected or page doesn't allow scripts
         }
 
@@ -447,7 +449,7 @@ async function startTranslation() {
                 }
             } catch (msgErr) {
                 lastError = msgErr;
-                console.log(`Attempt ${attempt + 1} failed:`, msgErr.message);
+                console.debug(`[Popup] sendMessage attempt ${attempt + 1} failed:`, msgErr.message);
                 // Wait before retry
                 await new Promise(resolve => setTimeout(resolve, 200));
             }

@@ -14,6 +14,7 @@ if (window.hasLLMTranslatorContentScript) {
     throw new Error('Content script already injected'); // Determines this execution stop
 }
 window.hasLLMTranslatorContentScript = true;
+console.debug('[Translator] Content script loaded and initialized on', window.location.href);
 
 // Track text nodes and their original content
 const textNodeMap = new Map();
@@ -565,6 +566,36 @@ async function translatePage(targetLanguage, sourceLanguage = 'auto', enableAuto
     currentTargetLanguage = targetLanguage;
     translationInProgress = true;
     translationCancelled = false;
+
+    // Keep-alive mechanism: prevent Firefox from killing the background script
+    // during long-running Ollama requests by sending periodic pings
+    let keepAlivePort = null;
+    let keepAliveInterval = null;
+    try {
+        keepAlivePort = browserAPI.runtime.connect({ name: 'keepalive' });
+        keepAlivePort.onDisconnect.addListener(() => {
+            console.debug('[Translator] Keep-alive port disconnected');
+            keepAlivePort = null;
+            if (keepAliveInterval) {
+                clearInterval(keepAliveInterval);
+                keepAliveInterval = null;
+            }
+        });
+        // Send periodic pings to keep background script active
+        keepAliveInterval = setInterval(() => {
+            if (keepAlivePort) {
+                try {
+                    keepAlivePort.postMessage({ type: 'ping' });
+                } catch (e) {
+                    clearInterval(keepAliveInterval);
+                    keepAliveInterval = null;
+                }
+            }
+        }, 20000);
+    } catch (e) {
+        console.warn('[Translator] Failed to open keep-alive port:', e.message);
+    }
+
     showStatus('Extracting text...');
 
     // Log source language if provided
@@ -717,6 +748,13 @@ async function translatePage(targetLanguage, sourceLanguage = 'auto', enableAuto
         translationCancelled = false;
         pendingTranslationQueue = [];
         window.removeEventListener('scroll', onScroll);
+        // Close keep-alive
+        if (keepAliveInterval) {
+            clearInterval(keepAliveInterval);
+        }
+        if (keepAlivePort) {
+            try { keepAlivePort.disconnect(); } catch (e) { /* already closed */ }
+        }
     }
 }
 

@@ -32,10 +32,19 @@ const DEFAULT_SETTINGS = {
     requestFormat: 'default', // 'default', 'translategemma', 'hunyuan', 'simple', 'custom'
     temperature: 0.3,
     useStructuredOutput: true,
-    showGlow: false  // Disabled by default
+    showGlow: false,  // Disabled by default
+    numCtx: 0,  // Ollama context window size (0 = use model default)
+    debug: false  // Enable verbose logging
 };
 
-
+// Debug logger - only outputs when debug setting is enabled
+let debugEnabled = false;
+function debugLog(...args) {
+    if (debugEnabled) console.log(...args);
+}
+function debugWarn(...args) {
+    if (debugEnabled) console.warn(...args);
+}
 
 const PROMPT_TEMPLATES = {
     default: {
@@ -80,6 +89,7 @@ async function loadSettings() {
     try {
         const result = await browserAPI.storage.local.get('settings');
         cachedSettings = { ...DEFAULT_SETTINGS, ...result.settings };
+        debugEnabled = !!cachedSettings.debug;
         return cachedSettings;
     } catch (e) {
         console.error('Failed to load settings:', e);
@@ -89,7 +99,10 @@ async function loadSettings() {
 }
 
 async function saveSettings(settings) {
-    cachedSettings = { ...DEFAULT_SETTINGS, ...settings };
+    // Merge: defaults < existing cached values < new settings
+    // This preserves fields like 'debug' that popup doesn't know about
+    cachedSettings = { ...DEFAULT_SETTINGS, ...cachedSettings, ...settings };
+    debugEnabled = !!cachedSettings.debug;
     await browserAPI.storage.local.set({ settings: cachedSettings });
     return cachedSettings;
 }
@@ -311,34 +324,57 @@ function parseTranslationResponse(response, originalItems) {
         return [{ id: originalItems[0].id, text: cleanTranslationText(text) }];
     }
 
-    // Fallback: parse line-by-line format using ORIGINAL item IDs
-    // console.log('[Background] Using fallback line-by-line parsing');
-    const lines = response.split('\n').filter(l => l.trim());
+    // Fallback: parse by [id]: markers, allowing multi-line translations
+    const lines = response.split('\n');
 
-    for (let i = 0; i < Math.min(lines.length, expectedCount); i++) {
-        const line = lines[i];
-        // Try to extract ID from line like "[4]: translated text" or "4: translated text"
-        const match = line.match(/^\[?(\d+)\]?:\s*(.+)$/);
+    // First pass: try to split by [id]: markers, collecting multi-line text
+    const idMarkerRegex = /^\[?(\d+)\]?:\s*(.*)$/;
+    const segments = []; // { id: number, text: string }
+    let currentSegment = null;
+
+    for (const line of lines) {
+        const match = line.match(idMarkerRegex);
         if (match) {
-            const parsedId = parseInt(match[1]);
-            // Check if this ID is in our original items
-            const isOurId = originalItems.some(item => item.id === parsedId);
+            // Save previous segment
+            if (currentSegment) {
+                segments.push(currentSegment);
+            }
+            currentSegment = { id: parseInt(match[1]), text: match[2] };
+        } else if (currentSegment) {
+            // Continuation of previous segment (multi-line translation)
+            currentSegment.text += '\n' + line;
+        }
+    }
+    if (currentSegment) {
+        segments.push(currentSegment);
+    }
+
+    // If we found segments with ID markers, use them
+    if (segments.length > 0) {
+        for (const seg of segments) {
+            const text = seg.text.trim();
+            if (!text) continue;
+            const isOurId = originalItems.some(item => item.id === seg.id);
             if (isOurId) {
-                translations.push({ id: parsedId, text: match[2].trim() });
+                translations.push({ id: seg.id, text: cleanTranslationText(text) });
             } else {
                 // LLM used sequential ID, map to our ID
-                translations.push({ id: originalItems[i]?.id, text: match[2].trim() });
+                const idx = segments.indexOf(seg);
+                translations.push({ id: originalItems[idx]?.id ?? seg.id, text: cleanTranslationText(text) });
             }
-        } else {
-            // Use the ORIGINAL item's ID
-            const originalId = originalItems[i]?.id;
-            if (originalId !== undefined) {
-                translations.push({ id: originalId, text: line.trim() });
-            }
+        }
+        return translations;
+    }
+
+    // Last resort: no ID markers found, treat each non-empty line as a translation
+    const nonEmptyLines = lines.filter(l => l.trim());
+    for (let i = 0; i < Math.min(nonEmptyLines.length, expectedCount); i++) {
+        const originalId = originalItems[i]?.id;
+        if (originalId !== undefined) {
+            translations.push({ id: originalId, text: cleanTranslationText(nonEmptyLines[i].trim()) });
         }
     }
 
-    // console.log(`[Background] Fallback parsed ${translations.length} translations`);
     return translations;
 }
 
@@ -352,7 +388,8 @@ async function detectModelProvider(modelId, settings) {
 async function callOllama(settings, modelId, systemPrompt, userPrompt) {
     const body = {
         model: modelId,
-        stream: false
+        stream: false,
+        keep_alive: '30m'
     };
 
     if (settings.useStructuredOutput) {
@@ -361,12 +398,18 @@ async function callOllama(settings, modelId, systemPrompt, userPrompt) {
 
     body.prompt = systemPrompt ? `${systemPrompt}\n\n${userPrompt}` : userPrompt;
 
+    body.options = {};
     if (settings.temperature !== undefined) {
-        body.options = { temperature: settings.temperature };
+        body.options.temperature = settings.temperature;
+    }
+    if (settings.numCtx) {
+        body.options.num_ctx = settings.numCtx;
     }
 
+    debugLog(`[Background] callOllama: sending request to ${settings.ollamaUrl}/api/generate, model=${modelId}`);
+
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 120000);
+    const timeoutId = setTimeout(() => controller.abort(), 300000);
 
     let response;
     try {
@@ -378,12 +421,15 @@ async function callOllama(settings, modelId, systemPrompt, userPrompt) {
         });
     } catch (e) {
         clearTimeout(timeoutId);
+        debugWarn(`[Background] callOllama: fetch error:`, e.name, e.message);
         if (e.name === 'AbortError') {
-            throw new Error('Ollama request timed out (120s). The server may be busy.');
+            throw new Error('Ollama request timed out (5 min). The server may be busy.');
         }
         throw e;
     }
     clearTimeout(timeoutId);
+
+    debugLog(`[Background] callOllama: response received, status=${response.status}`);
 
     if (!response.ok) {
         const error = await response.text();
@@ -391,6 +437,7 @@ async function callOllama(settings, modelId, systemPrompt, userPrompt) {
     }
 
     const data = await response.json();
+    debugLog(`[Background] callOllama: response parsed, length=${data.response?.length || 0}`);
     return data.response;
 }
 
@@ -443,7 +490,7 @@ async function callLMStudio(settings, modelId, systemPrompt, userPrompt) {
     }
 
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 120000);
+    const timeoutId = setTimeout(() => controller.abort(), 300000);
 
     let response;
     try {
@@ -456,7 +503,7 @@ async function callLMStudio(settings, modelId, systemPrompt, userPrompt) {
     } catch (e) {
         clearTimeout(timeoutId);
         if (e.name === 'AbortError') {
-            throw new Error('LMStudio request timed out (120s). The server may be busy.');
+            throw new Error('LMStudio request timed out (5 min). The server may be busy.');
         }
         throw e;
     }
@@ -533,6 +580,7 @@ async function translate(textItems, targetLanguage, settings) {
     const finalSystemPrompt = buildPrompt(systemPrompt, templateVars);
 
     // Call the appropriate provider
+    debugLog(`[Background] translate: calling provider=${provider}, model=${modelId}, format=${templateKey}, items=${textItems.length}`);
     let response;
     if (provider === 'ollama') {
         response = await callOllama(settings, modelId, finalSystemPrompt, userPrompt);
@@ -540,8 +588,8 @@ async function translate(textItems, targetLanguage, settings) {
         response = await callLMStudio(settings, modelId, finalSystemPrompt, userPrompt);
     }
 
-    // console.log(`[Background] Raw LLM response (first 500 chars):`, response.substring(0, 500));
-    // console.log(`[Background] Sent ${textItems.length} items, IDs:`, textItems.map(t => t.id));
+    debugLog(`[Background] Raw LLM response (first 500 chars):`, response.substring(0, 500));
+    debugLog(`[Background] Sent ${textItems.length} items, IDs:`, textItems.map(t => t.id));
 
     // Parse response - pass original items so we can use their IDs in fallback
     return parseTranslationResponse(response, textItems);
@@ -552,11 +600,10 @@ async function translate(textItems, targetLanguage, settings) {
 // ============================================================================
 
 browserAPI.runtime.onMessage.addListener((message, sender, sendResponse) => {
-    // console.log('[Background] Received message:', message.type);
-
     (async () => {
         try {
             const settings = await getSettings();
+            debugLog('[Background] Received message:', message.type, 'from:', sender.tab ? `tab ${sender.tab.id}` : 'popup/other');
 
             switch (message.type) {
                 case 'GET_SETTINGS':
@@ -696,7 +743,31 @@ browserAPI.contextMenus.onClicked.addListener(async (info, tab) => {
     }
 });
 
+// Keep-alive port handler: prevents Firefox from terminating the service worker
+// during long-running fetch requests (e.g. waiting for Ollama response)
+browserAPI.runtime.onConnect.addListener((port) => {
+    if (port.name === 'keepalive') {
+        debugLog('[Background] Keep-alive port connected');
+        port.onMessage.addListener((msg) => {
+            if (msg.type === 'ping') {
+                port.postMessage({ type: 'pong' });
+            }
+        });
+        port.onDisconnect.addListener(() => {
+            debugLog('[Background] Keep-alive port disconnected');
+        });
+    }
+});
+
+// Update cached settings when storage changes (e.g. debug flag toggled from console)
+browserAPI.storage.onChanged.addListener((changes) => {
+    if (changes.settings) {
+        cachedSettings = { ...DEFAULT_SETTINGS, ...changes.settings.newValue };
+        debugEnabled = !!cachedSettings.debug;
+    }
+});
+
 // Initialize settings on startup
 loadSettings().then(() => {
-    console.log('[Background] Local LLM Translator background script loaded');
+    debugLog('[Background] Local LLM Translator background script loaded');
 });
