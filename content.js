@@ -848,6 +848,7 @@ async function translateSelection(targetLanguage, sourceLanguage = 'auto') {
     }
 
     console.log('[Translator] Starting selection translation, target:', targetLanguage);
+    currentTargetLanguage = targetLanguage;
     translationInProgress = true;
     translationCancelled = false;
 
